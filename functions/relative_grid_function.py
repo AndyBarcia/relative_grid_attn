@@ -14,32 +14,30 @@ except ImportError:
 
 class RelativeGridAttnCUDAFunction(Function):
     @staticmethod
-    def forward(ctx, queries, keys, pos, rel_bias, grid_x, grid_y):
-        ctx.save_for_backward(queries, keys, pos, rel_bias, grid_x, grid_y)
+    def forward(ctx, queries, keys, pos, rel_bias):
+        ctx.save_for_backward(queries, keys, pos, rel_bias)
         output = relative_grid_attn.forward(
-            queries, keys, pos, rel_bias, grid_x, grid_y
+            queries, keys, pos, rel_bias
         )
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        queries, keys, pos, rel_bias, grid_x, grid_y = ctx.saved_tensors
+        queries, keys, pos, rel_bias = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_queries, grad_keys, grad_rel_bias = relative_grid_attn.backward(
-            grad_output, queries, keys, pos, rel_bias, grid_x, grid_y
+            grad_output, queries, keys, pos, rel_bias
         )
         return grad_queries, grad_keys, None, grad_rel_bias, None, None
 
 
-def relative_grid_attn_python(queries, keys, pos, rel_bias, grid_x, grid_y):
+def relative_grid_attn_python(queries, keys, pos, rel_bias):
     """
     PyTorch reference implementation for the fused attention.
     queries:   [B, Q, C]
     keys:      [B, H, W, C]
     pos:       [B, Q, 4] (x_center, y_center, width, height) - normalized [0,1] or pixel scale
     rel_bias:  [H_rel, W_rel, C]
-    grid_x:    [H, W] - normalized [0,1] or pixel scale, same as pos
-    grid_y:    [H, W] - normalized [0,1] or pixel scale, same as pos
     output:    [B, Q, H, W]
     """
     B, Q, C = queries.shape
@@ -71,6 +69,10 @@ def relative_grid_attn_python(queries, keys, pos, rel_bias, grid_x, grid_y):
     pos_height   = pos[:, :, 3].unsqueeze(-1).unsqueeze(-1)
 
     # grid_x_exp, grid_y_exp: (1, 1, H, W)
+    grid_y_coords = torch.linspace(0, 1, H, device=queries.device, dtype=queries.dtype)
+    grid_x_coords = torch.linspace(0, 1, W, device=queries.device, dtype=queries.dtype)
+    grid_x, grid_y = torch.meshgrid(grid_x_coords, grid_y_coords, indexing='xy')
+
     grid_x_expanded = grid_x.unsqueeze(0).unsqueeze(0)
     grid_y_expanded = grid_y.unsqueeze(0).unsqueeze(0)
 

@@ -11,13 +11,11 @@
 const int THREADS_PER_BLOCK = 512;
 
 __global__ void fused_attn_forward_kernel(
-    const float* queries,   // [B, Q, C]
-    const float* keys,      // [B, H, W, C]
-    const float* pos,       // [B, Q, 4]
-    const float* rel_bias,  // [H_rel, W_rel, C]
-    const float* grid_x,    // [H, W]
-    const float* grid_y,    // [H, W]
-    float* output,          // [B, Q, H, W]
+    const float* __restrict__ queries,   // [B, Q, C]
+    const float* __restrict__ keys,      // [B, H, W, C]
+    const float* __restrict__ pos,       // [B, Q, 4]
+    const float* __restrict__ rel_bias,  // [H_rel, W_rel, C]
+    float* __restrict__ output,          // [B, Q, H, W]
     const int B,
     const int Q,
     const int C,
@@ -41,13 +39,6 @@ __global__ void fused_attn_forward_kernel(
     const float* cur_query = &queries[b * Q * C + q * C];
     const float* cur_key = &keys[b * H * W * C + h * W * C + w * C];
     
-    // Compute content-based attention
-    float content_val = 0.0f;
-    for (int c = 0; c < C; c++) {
-        content_val += cur_query[c] * cur_key[c];
-    }
-    content_val *= scale;
-
     // Get position data
     const float x_center = pos[b * Q * 4 + q * 4];
     const float y_center = pos[b * Q * 4 + q * 4 + 1];
@@ -55,8 +46,8 @@ __global__ void fused_attn_forward_kernel(
     const float height = pos[b * Q * 4 + q * 4 + 3];
     
     // Compute relative coordinates
-    const float gx = grid_x[h * W + w];
-    const float gy = grid_y[h * W + w];
+    const float gx = ((float)w)/((float)(W-1));
+    const float gy = ((float)h)/((float)(H-1));
     float rel_x = (x_center - gx) / width;
     float rel_y = (y_center - gy) / height;
     
@@ -74,38 +65,50 @@ __global__ void fused_attn_forward_kernel(
     const float w10 = (v - i0) * (j1 - u);
     const float w11 = (v - i0) * (u - j0);
     
+    // Check boundaries once
+    const bool in00 = (i0 >= 0) && (i0 < H_rel) && (j0 >= 0) && (j0 < W_rel);
+    const bool in01 = (i0 >= 0) && (i0 < H_rel) && (j1 >= 0) && (j1 < W_rel);
+    const bool in10 = (i1 >= 0) && (i1 < H_rel) && (j0 >= 0) && (j0 < W_rel);
+    const bool in11 = (i1 >= 0) && (i1 < H_rel) && (j1 >= 0) && (j1 < W_rel);
+
+    // Precompute rel_bias offsets
+    const int offset00 = in00 ? (i0 * W_rel * C + j0 * C) : -1;
+    const int offset01 = in01 ? (i0 * W_rel * C + j1 * C) : -1;
+    const int offset10 = in10 ? (i1 * W_rel * C + j0 * C) : -1;
+    const int offset11 = in11 ? (i1 * W_rel * C + j1 * C) : -1;
+
+    // Fused loop for content and relative attention
+    float content_val = 0.0f;
     float rel_val = 0.0f;
     for (int c = 0; c < C; c++) {
+        // Load once per channel
+        const float q_val = cur_query[c];
+        const float k_val = cur_key[c];
+        
+        // Content attention
+        content_val += q_val * k_val;
+        
+        // Relative attention
         float bias_val = 0.0f;
-        if (i0 >= 0 && i0 < H_rel && j0 >= 0 && j0 < W_rel) {
-            bias_val += w00 * rel_bias[i0 * W_rel * C + j0 * C + c];
-        }
-        if (i0 >= 0 && i0 < H_rel && j1 >= 0 && j1 < W_rel) {
-            bias_val += w01 * rel_bias[i0 * W_rel * C + j1 * C + c];
-        }
-        if (i1 >= 0 && i1 < H_rel && j0 >= 0 && j0 < W_rel) {
-            bias_val += w10 * rel_bias[i1 * W_rel * C + j0 * C + c];
-        }
-        if (i1 >= 0 && i1 < H_rel && j1 >= 0 && j1 < W_rel) {
-            bias_val += w11 * rel_bias[i1 * W_rel * C + j1 * C + c];
-        }
-        rel_val += cur_query[c] * bias_val;
+        if (in00) bias_val += w00 * rel_bias[offset00 + c];
+        if (in01) bias_val += w01 * rel_bias[offset01 + c];
+        if (in10) bias_val += w10 * rel_bias[offset10 + c];
+        if (in11) bias_val += w11 * rel_bias[offset11 + c];
+        rel_val += q_val * bias_val;
     }
-    
+    content_val *= scale;
     output[idx] = content_val + rel_val;
 }
 
 __global__ void fused_attn_backward_kernel(
-    const float* grad_out,   // [B, Q, H, W]
-    const float* queries,    // [B, Q, C]
-    const float* keys,       // [B, H, W, C]
-    const float* pos,        // [B, Q, 4]
-    const float* rel_bias,   // [H_rel, W_rel, C]
-    const float* grid_x,     // [H, W]
-    const float* grid_y,     // [H, W]
-    float* grad_queries,     // [B, Q, C]
-    float* grad_keys,        // [B, H, W, C]
-    float* grad_rel_bias,    // [H_rel, W_rel, C]
+    const float* __restrict__ grad_out,   // [B, Q, H, W]
+    const float* __restrict__ queries,    // [B, Q, C]
+    const float* __restrict__ keys,       // [B, H, W, C]
+    const float* __restrict__ pos,        // [B, Q, 4]
+    const float* __restrict__ rel_bias,   // [H_rel, W_rel, C]
+    float* __restrict__ grad_queries,     // [B, Q, C]
+    float* __restrict__ grad_keys,        // [B, H, W, C]
+    float* __restrict__ grad_rel_bias,    // [H_rel, W_rel, C]
     const int B,
     const int Q,
     const int C,
@@ -130,13 +133,6 @@ __global__ void fused_attn_backward_kernel(
     const int query_idx = b * Q * C + q * C;
     const int key_idx = b * H * W * C + h * W * C + w * C;
     
-    // Compute gradients for content part
-    for (int c = 0; c < C; c++) {
-        float grad_scale = dL * scale;
-        atomicAdd(&grad_queries[query_idx + c], grad_scale * keys[key_idx + c]);
-        atomicAdd(&grad_keys[key_idx + c], grad_scale * queries[query_idx + c]);
-    }
-    
     // Get position data
     const float x_center = pos[b * Q * 4 + q * 4];
     const float y_center = pos[b * Q * 4 + q * 4 + 1];
@@ -144,9 +140,8 @@ __global__ void fused_attn_backward_kernel(
     const float height = pos[b * Q * 4 + q * 4 + 3];
     
     // Compute relative coordinates
-    // TODO compute gx and gy based on h/H and w/W without using grid_x and grid_y
-    const float gx = grid_x[h * W + w];
-    const float gy = grid_y[h * W + w];
+    const float gx = ((float)w)/((float)(W-1));
+    const float gy = ((float)h)/((float)(H-1));
     float rel_x = (x_center - gx) / width;
     float rel_y = (y_center - gy) / height;
     
@@ -164,40 +159,57 @@ __global__ void fused_attn_backward_kernel(
     const float w10 = (v - i0) * (j1 - u);
     const float w11 = (v - i0) * (u - j0);
     
+    // Check boundaries once
+    const bool in00 = (i0 >= 0) && (i0 < H_rel) && (j0 >= 0) && (j0 < W_rel);
+    const bool in01 = (i0 >= 0) && (i0 < H_rel) && (j1 >= 0) && (j1 < W_rel);
+    const bool in10 = (i1 >= 0) && (i1 < H_rel) && (j0 >= 0) && (j0 < W_rel);
+    const bool in11 = (i1 >= 0) && (i1 < H_rel) && (j1 >= 0) && (j1 < W_rel);
+
+    // Precompute rel_bias offsets
+    const int offset00 = in00 ? (i0 * W_rel * C + j0 * C) : -1;
+    const int offset01 = in01 ? (i0 * W_rel * C + j1 * C) : -1;
+    const int offset10 = in10 ? (i1 * W_rel * C + j0 * C) : -1;
+    const int offset11 = in11 ? (i1 * W_rel * C + j1 * C) : -1;
+
+    // Precompute interpolation weights for gradient updates
+    const float dL_w00 = dL * w00;
+    const float dL_w01 = dL * w01;
+    const float dL_w10 = dL * w10;
+    const float dL_w11 = dL * w11;
+
+    // Fused loop for gradients
     for (int c = 0; c < C; c++) {
-        float I00 = 0.0f, I01 = 0.0f, I10 = 0.0f, I11 = 0.0f;
-        
-        // Gradient for queries (relative part)
-        if (i0 >= 0 && i0 < H_rel && j0 >= 0 && j0 < W_rel) {
-            I00 = rel_bias[i0 * W_rel * C + j0 * C + c];
-        }
-        if (i0 >= 0 && i0 < H_rel && j1 >= 0 && j1 < W_rel) {
-            I01 = rel_bias[i0 * W_rel * C + j1 * C + c];
-        }
-        if (i1 >= 0 && i1 < H_rel && j0 >= 0 && j0 < W_rel) {
-            I10 = rel_bias[i1 * W_rel * C + j0 * C + c];
-        }
-        if (i1 >= 0 && i1 < H_rel && j1 >= 0 && j1 < W_rel) {
-            I11 = rel_bias[i1 * W_rel * C + j1 * C + c];
-        }
-        
-        float interp_val = w00 * I00 + w01 * I01 + w10 * I10 + w11 * I11;
-        atomicAdd(&grad_queries[query_idx + c], dL * interp_val);
-        
-        // Gradient for rel_bias
         const float q_val = queries[query_idx + c];
-        if (i0 >= 0 && i0 < H_rel && j0 >= 0 && j0 < W_rel) {
-            atomicAdd(&grad_rel_bias[i0 * W_rel * C + j0 * C + c], dL * q_val * w00);
+        const float k_val = keys[key_idx + c];
+        const float grad_scale = dL * scale;
+
+        // Content gradients
+        atomicAdd(&grad_queries[query_idx + c], grad_scale * k_val);
+        atomicAdd(&grad_keys[key_idx + c], grad_scale * q_val);
+
+        // Relative gradients for queries and rel_bias
+        float interp_val = 0.0f;
+        if (in00) {
+            const float rb_val = rel_bias[offset00 + c];
+            interp_val += w00 * rb_val;
+            atomicAdd(&grad_rel_bias[offset00 + c], dL_w00 * q_val);
         }
-        if (i0 >= 0 && i0 < H_rel && j1 >= 0 && j1 < W_rel) {
-            atomicAdd(&grad_rel_bias[i0 * W_rel * C + j1 * C + c], dL * q_val * w01);
+        if (in01) {
+            const float rb_val = rel_bias[offset01 + c];
+            interp_val += w01 * rb_val;
+            atomicAdd(&grad_rel_bias[offset01 + c], dL_w01 * q_val);
         }
-        if (i1 >= 0 && i1 < H_rel && j0 >= 0 && j0 < W_rel) {
-            atomicAdd(&grad_rel_bias[i1 * W_rel * C + j0 * C + c], dL * q_val * w10);
+        if (in10) {
+            const float rb_val = rel_bias[offset10 + c];
+            interp_val += w10 * rb_val;
+            atomicAdd(&grad_rel_bias[offset10 + c], dL_w10 * q_val);
         }
-        if (i1 >= 0 && i1 < H_rel && j1 >= 0 && j1 < W_rel) {
-            atomicAdd(&grad_rel_bias[i1 * W_rel * C + j1 * C + c], dL * q_val * w11);
+        if (in11) {
+            const float rb_val = rel_bias[offset11 + c];
+            interp_val += w11 * rb_val;
+            atomicAdd(&grad_rel_bias[offset11 + c], dL_w11 * q_val);
         }
+        atomicAdd(&grad_queries[query_idx + c], dL * interp_val);
     }
 }
 
@@ -205,16 +217,12 @@ torch::Tensor fused_attn_forward(
     const torch::Tensor& queries,
     const torch::Tensor& keys,
     const torch::Tensor& pos,
-    const torch::Tensor& rel_bias,
-    const torch::Tensor& grid_x,
-    const torch::Tensor& grid_y
+    const torch::Tensor& rel_bias
 ) {
     CHECK_INPUT(queries);
     CHECK_INPUT(keys);
     CHECK_INPUT(pos);
     CHECK_INPUT(rel_bias);
-    CHECK_INPUT(grid_x);
-    CHECK_INPUT(grid_y);
     
     const int B = queries.size(0);
     const int Q = queries.size(1);
@@ -238,8 +246,6 @@ torch::Tensor fused_attn_forward(
         keys.data_ptr<float>(),
         pos.data_ptr<float>(),
         rel_bias.data_ptr<float>(),
-        grid_x.data_ptr<float>(),
-        grid_y.data_ptr<float>(),
         output.data_ptr<float>(),
         B, Q, C, H, W, H_rel, W_rel,
         scale
@@ -253,17 +259,13 @@ std::vector<torch::Tensor> fused_attn_backward(
     const torch::Tensor& queries,
     const torch::Tensor& keys,
     const torch::Tensor& pos,
-    const torch::Tensor& rel_bias,
-    const torch::Tensor& grid_x,
-    const torch::Tensor& grid_y
+    const torch::Tensor& rel_bias
 ) {
     CHECK_INPUT(grad_out);
     CHECK_INPUT(queries);
     CHECK_INPUT(keys);
     CHECK_INPUT(pos);
     CHECK_INPUT(rel_bias);
-    CHECK_INPUT(grid_x);
-    CHECK_INPUT(grid_y);
     
     const int B = queries.size(0);
     const int Q = queries.size(1);
@@ -287,8 +289,6 @@ std::vector<torch::Tensor> fused_attn_backward(
         keys.data_ptr<float>(),
         pos.data_ptr<float>(),
         rel_bias.data_ptr<float>(),
-        grid_x.data_ptr<float>(),
-        grid_y.data_ptr<float>(),
         grad_queries.data_ptr<float>(),
         grad_keys.data_ptr<float>(),
         grad_rel_bias.data_ptr<float>(),

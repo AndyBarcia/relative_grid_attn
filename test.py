@@ -63,11 +63,6 @@ def run_test():
     pos_wh = torch.rand(B, Q, 2, device=device, dtype=dtype) * 0.5 + 0.1 # Ensure width/height > 0
     pos = torch.cat([pos_xy, pos_wh], dim=-1)
     rel_bias = torch.randn(H_rel, W_rel, C, device=device, dtype=dtype)
-    grid_y_coords = torch.linspace(0, 1, H, device=device, dtype=dtype)
-    grid_x_coords = torch.linspace(0, 1, W, device=device, dtype=dtype)
-    grid_x, grid_y = torch.meshgrid(grid_x_coords, grid_y_coords, indexing='xy')
-    grid_x = grid_x.contiguous()
-    grid_y = grid_y.contiguous()
     
     after_tensor_creation = get_memory_info()
     print_memory_usage("After Tensor Creation", after_tensor_creation)
@@ -78,15 +73,10 @@ def run_test():
     keys_py = keys.clone().requires_grad_(True)
     pos_py = pos.clone().requires_grad_(False)
     rel_bias_py = rel_bias.clone().requires_grad_(True)
-    grid_x_py = grid_x.clone().requires_grad_(False)
-    grid_y_py = grid_y.clone().requires_grad_(False)
     
     # --- Forward and Backward for PyTorch implementation ---
     print("--- PyTorch Implementation ---")
-    
-    # Memory before PyTorch forward
-    before_py_fwd = get_memory_info()
-    
+        
     # PyTorch Profiler for detailed analysis
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if use_cuda_device else [ProfilerActivity.CPU],
@@ -95,35 +85,17 @@ def run_test():
         with_stack=True
     ) as prof:
         with record_function("pytorch_forward"):
-            start_time = time.time()
             output_py = relative_grid_attn_python(
-                queries_py, keys_py, pos_py, rel_bias_py, grid_x_py, grid_y_py,
+                queries_py, keys_py, pos_py, rel_bias_py
             )
             if device.type == 'cuda': 
                 torch.cuda.synchronize()
-            py_fwd_time = time.time() - start_time
     
-    after_py_fwd = get_memory_info()
-    print(f"PyTorch forward time: {py_fwd_time:.6f} s")
-    print_memory_usage("After PyTorch Forward", after_py_fwd)
-    
-    # Memory difference for forward pass
-    py_fwd_memory_diff = {
-        'gpu_allocated': after_py_fwd['gpu_allocated'] - before_py_fwd['gpu_allocated'],
-        'gpu_cached': after_py_fwd['gpu_cached'] - before_py_fwd['gpu_cached'],
-        'cpu_memory': after_py_fwd['cpu_memory'] - before_py_fwd['cpu_memory']
-    }
-    print("PyTorch Forward Memory Usage:")
-    print(f"  CPU Memory Delta: {py_fwd_memory_diff['cpu_memory']:.2f} MB")
-    if torch.cuda.is_available():
-        print(f"  GPU Allocated Delta: {py_fwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  GPU Cached Delta: {py_fwd_memory_diff['gpu_cached']:.2f} MB")
+    print("PYTORCH FORWARD PROFILER RESULTS:")
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
     grad_output_val = torch.randn_like(output_py)
-    
-    # Memory before PyTorch backward
-    before_py_bwd = get_memory_info()
-    
+        
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if use_cuda_device else [ProfilerActivity.CPU],
         record_shapes=True,
@@ -131,30 +103,12 @@ def run_test():
         with_stack=True
     ) as prof_bwd:
         with record_function("pytorch_backward"):
-            start_time = time.time()
             output_py.backward(grad_output_val.clone())
             if device.type == 'cuda': 
                 torch.cuda.synchronize()
-            py_bwd_time = time.time() - start_time
     
-    after_py_bwd = get_memory_info()
-    print(f"PyTorch backward time: {py_bwd_time:.6f} s")
-    print_memory_usage("After PyTorch Backward", after_py_bwd)
-    
-    # Memory difference for backward pass
-    py_bwd_memory_diff = {
-        'gpu_allocated': after_py_bwd['gpu_allocated'] - before_py_bwd['gpu_allocated'],
-        'gpu_cached': after_py_bwd['gpu_cached'] - before_py_bwd['gpu_cached'],
-        'cpu_memory': after_py_bwd['cpu_memory'] - before_py_bwd['cpu_memory']
-    }
-    print("PyTorch Backward Memory Usage:")
-    print(f"  CPU Memory Delta: {py_bwd_memory_diff['cpu_memory']:.2f} MB")
-    if torch.cuda.is_available():
-        print(f"  GPU Allocated Delta: {py_bwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  GPU Cached Delta: {py_bwd_memory_diff['gpu_cached']:.2f} MB")
-        print(f"  GPU Peak Memory: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-    
-    print()
+    print("PYTORCH BACKWARD PROFILER RESULTS:")
+    print(prof_bwd.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
     # --- Forward and Backward for CUDA implementation (if available) ---
     if use_cuda_device:
@@ -167,12 +121,7 @@ def run_test():
         keys_cuda = keys.clone().requires_grad_(True)
         pos_cuda = pos.clone().requires_grad_(False)
         rel_bias_cuda = rel_bias.clone().requires_grad_(True)
-        grid_x_cuda = grid_x.clone().requires_grad_(False)
-        grid_y_cuda = grid_y.clone().requires_grad_(False)
-        
-        # Memory before CUDA forward
-        before_cuda_fwd = get_memory_info()
-        
+                
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
@@ -180,30 +129,13 @@ def run_test():
             with_stack=True
         ) as prof_cuda:
             with record_function("cuda_forward"):
-                start_time = time.time()
                 output_cuda = RelativeGridAttnCUDAFunction.apply(
-                    queries_cuda, keys_cuda, pos_cuda, rel_bias_cuda, grid_x_cuda, grid_y_cuda,
+                    queries_cuda, keys_cuda, pos_cuda, rel_bias_cuda,
                 )
                 torch.cuda.synchronize()
-                cuda_fwd_time = time.time() - start_time
         
-        after_cuda_fwd = get_memory_info()
-        print(f"CUDA forward time: {cuda_fwd_time:.6f} s")
-        print_memory_usage("After CUDA Forward", after_cuda_fwd)
-        
-        # Memory difference for CUDA forward pass
-        cuda_fwd_memory_diff = {
-            'gpu_allocated': after_cuda_fwd['gpu_allocated'] - before_cuda_fwd['gpu_allocated'],
-            'gpu_cached': after_cuda_fwd['gpu_cached'] - before_cuda_fwd['gpu_cached'],
-            'cpu_memory': after_cuda_fwd['cpu_memory'] - before_cuda_fwd['cpu_memory']
-        }
-        print("CUDA Forward Memory Usage:")
-        print(f"  CPU Memory Delta: {cuda_fwd_memory_diff['cpu_memory']:.2f} MB")
-        print(f"  GPU Allocated Delta: {cuda_fwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  GPU Cached Delta: {cuda_fwd_memory_diff['gpu_cached']:.2f} MB")
-        
-        # Memory before CUDA backward
-        before_cuda_bwd = get_memory_info()
+        print("CUDA FORWARD PROFILER RESULTS:")
+        print(prof_cuda.key_averages().table(sort_by="cuda_time_total", row_limit=10))
         
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -212,43 +144,11 @@ def run_test():
             with_stack=True
         ) as prof_cuda_bwd:
             with record_function("cuda_backward"):
-                start_time = time.time()
                 output_cuda.backward(grad_output_val.clone())
                 torch.cuda.synchronize()
-                cuda_bwd_time = time.time() - start_time
         
-        after_cuda_bwd = get_memory_info()
-        print(f"CUDA backward time: {cuda_bwd_time:.6f} s")
-        print_memory_usage("After CUDA Backward", after_cuda_bwd)
-        
-        # Memory difference for CUDA backward pass
-        cuda_bwd_memory_diff = {
-            'gpu_allocated': after_cuda_bwd['gpu_allocated'] - before_cuda_bwd['gpu_allocated'],
-            'gpu_cached': after_cuda_bwd['gpu_cached'] - before_cuda_bwd['gpu_cached'],
-            'cpu_memory': after_cuda_bwd['cpu_memory'] - before_cuda_bwd['cpu_memory']
-        }
-        print("CUDA Backward Memory Usage:")
-        print(f"  CPU Memory Delta: {cuda_bwd_memory_diff['cpu_memory']:.2f} MB")
-        print(f"  GPU Allocated Delta: {cuda_bwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  GPU Cached Delta: {cuda_bwd_memory_diff['gpu_cached']:.2f} MB")
-        print(f"  GPU Peak Memory: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
-        
-        # --- Comparisons ---
-        print("\n--- Performance Comparison (CUDA vs PyTorch) ---")
-        print(f"Forward speedup: {py_fwd_time / cuda_fwd_time:.2f}x")
-        print(f"Backward speedup: {py_bwd_time / cuda_bwd_time:.2f}x")
-        print(f"Total speedup: {(py_fwd_time + py_bwd_time) / (cuda_fwd_time + cuda_bwd_time):.2f}x")
-        
-        print("\n--- Memory Comparison (CUDA vs PyTorch) ---")
-        print("Forward Pass Memory Usage:")
-        print(f"  PyTorch GPU Delta: {py_fwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  CUDA GPU Delta: {cuda_fwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  Memory Efficiency (CUDA vs PyTorch): {py_fwd_memory_diff['gpu_allocated'] / cuda_fwd_memory_diff['gpu_allocated']:.2f}x" if cuda_fwd_memory_diff['gpu_allocated'] > 0 else "N/A")
-        
-        print("Backward Pass Memory Usage:")
-        print(f"  PyTorch GPU Delta: {py_bwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  CUDA GPU Delta: {cuda_bwd_memory_diff['gpu_allocated']:.2f} MB")
-        print(f"  Memory Efficiency (CUDA vs PyTorch): {py_bwd_memory_diff['gpu_allocated'] / cuda_bwd_memory_diff['gpu_allocated']:.2f}x" if cuda_bwd_memory_diff['gpu_allocated'] > 0 else "N/A")
+        print("CUDA BACKWARD PROFILER RESULTS:")
+        print(prof_cuda_bwd.key_averages().table(sort_by="cuda_time_total", row_limit=10))
         
         print("\n--- Numerical Accuracy Comparison ---")
         fwd_atol, fwd_rtol = 1e-5, 1e-4
