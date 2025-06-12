@@ -17,14 +17,12 @@ class RelativeGridAttention(torch.nn.Module):
         keys: torch.Tensor,
         pos: torch.Tensor,
         rel_bias: torch.Tensor,
-        grid_x: torch.Tensor,
-        grid_y: torch.Tensor
     ) -> torch.Tensor:
         if self.implementation == "cuda":
             return RelativeGridAttnCUDAFunction.apply(
-                queries, keys, pos, rel_bias, grid_x, grid_y
+                queries, keys, pos, rel_bias
             )
         elif self.implementation == "python":
             return relative_grid_attn_python(
-                queries, keys, pos, rel_bias, grid_x, grid_y
+                queries, keys, pos, rel_bias
             )
