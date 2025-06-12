@@ -35,14 +35,16 @@ def print_memory_usage(label, mem_info):
 def run_test():
     # Parameters
     B, Q, C = 32, 300, 256
-    H, W = 16, 16
+    # Multi-resolution settings
+    levels = [ (32, 32), ]  # HxW for each level
+    L = len(levels)  # Number of levels
     H_rel, W_rel = 32, 32
     dtype = torch.float32
     
     # Determine device: Use CUDA if extension is available AND torch.cuda is available
     use_cuda_device = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda_device else "cpu")
-    print(f"Testing with: B={B}, Q={Q}, C={C}, H={H}, W={W}, H_rel={H_rel}, W_rel={W_rel}")
+    print(f"Testing with: B={B}, Q={Q}, C={C}, H_rel={H_rel}, W_rel={W_rel}")
     print(f"Torch CUDA available: {torch.cuda.is_available()}")
     print(f"Using device: {device}, dtype: {dtype}\n")
     
@@ -58,12 +60,32 @@ def run_test():
     
     # Create random input tensors
     queries = torch.randn(B, Q, C, device=device, dtype=dtype)
-    keys = torch.randn(B, H, W, C, device=device, dtype=dtype)
     pos_xy = torch.rand(B, Q, 2, device=device, dtype=dtype)
     pos_wh = torch.rand(B, Q, 2, device=device, dtype=dtype) * 0.5 + 0.1 # Ensure width/height > 0
     pos = torch.cat([pos_xy, pos_wh], dim=-1)
+    pos[:,:,0] = 0.5
+    pos[:,:,1] = 0.5
+    pos[:,:,2] = 0.1
+    pos[:,:,3] = 0.1
     rel_bias = torch.randn(H_rel, W_rel, C, device=device, dtype=dtype)
-    
+
+    # Create multi-resolution keys
+    keys_list = []
+    spatial_shapes = []
+    level_start_index = []
+    start_idx = 0
+
+    for H, W in levels:
+        keys_l = torch.randn(B, H * W, C, device=device, dtype=dtype)
+        keys_list.append(keys_l)
+        spatial_shapes.append([H, W])
+        level_start_index.append(start_idx)
+        start_idx += H * W
+
+    keys = torch.cat(keys_list, dim=1)  # [B, HWL, C]
+    spatial_shapes = torch.tensor(spatial_shapes, dtype=torch.int32, device=device)  # [L, 2]
+    level_start_index = torch.tensor(level_start_index, dtype=torch.int32, device=device)  # [L]
+
     after_tensor_creation = get_memory_info()
     print_memory_usage("After Tensor Creation", after_tensor_creation)
     print()
@@ -86,7 +108,7 @@ def run_test():
     ) as prof:
         with record_function("pytorch_forward"):
             output_py = relative_grid_attn_python(
-                queries_py, keys_py, pos_py, rel_bias_py
+                queries_py, keys_py, pos_py, rel_bias_py, spatial_shapes, level_start_index
             )
             if device.type == 'cuda': 
                 torch.cuda.synchronize()
@@ -130,7 +152,7 @@ def run_test():
         ) as prof_cuda:
             with record_function("cuda_forward"):
                 output_cuda = RelativeGridAttnCUDAFunction.apply(
-                    queries_cuda, keys_cuda, pos_cuda, rel_bias_cuda,
+                    queries_cuda, keys_cuda, pos_cuda, rel_bias_cuda, spatial_shapes, level_start_index
                 )
                 torch.cuda.synchronize()
         
