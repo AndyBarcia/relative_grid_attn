@@ -107,6 +107,6 @@ def relative_grid_attn_python(
         rel_attn = einsum(queries, sampled_rel_bias, "b q c, b q h w c -> b q h w")
 
         # Add the relative attention to the content attention.
-        content_attn[:, :, start_index:start_index + H * W] += content_attn[:, :, start_index:start_index + H * W].clone() + rel_attn.flatten(-2,-1)
+        content_attn[:, :, start_index:start_index + H * W] += rel_attn.flatten(-2,-1)
 
     return content_attn
