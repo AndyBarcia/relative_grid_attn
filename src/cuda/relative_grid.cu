@@ -319,23 +319,15 @@ std::vector<torch::Tensor> fused_attn_backward(
         const int total_elements = B * Q * H * W;
         const int blocks = (total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
         
-        // Temporary tensors for accumulation
-        auto grad_queries_level = torch::zeros_like(queries);
-        auto grad_rel_bias_level = torch::zeros_like(rel_bias);
-        
         relative_attention_backward_kernel<<<blocks, THREADS_PER_BLOCK>>>(
             grad_level.data_ptr<float>(),
             queries.data_ptr<float>(),
             pos.data_ptr<float>(),
             rel_bias.data_ptr<float>(),
-            grad_queries_level.data_ptr<float>(),
-            grad_rel_bias_level.data_ptr<float>(),
+            grad_queries.data_ptr<float>(),
+            grad_rel_bias.data_ptr<float>(),
             B, Q, C, H, W, H_rel, W_rel
         );
-        
-        // Accumulate gradients
-        grad_queries += grad_queries_level;
-        grad_rel_bias += grad_rel_bias_level;
     }
     
     return {grad_queries, grad_keys, grad_rel_bias};
