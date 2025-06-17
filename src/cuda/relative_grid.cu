@@ -88,6 +88,18 @@ __global__ void relative_attention_forward_kernel(
     int ix_se = ix_nw + 1;
     int iy_se = iy_nw + 1;
     
+    // Check bounds for all four corners
+    bool nw_in = within_bounds_2d(iy_nw, ix_nw, H_rel, W_rel);
+    bool ne_in = within_bounds_2d(iy_ne, ix_ne, H_rel, W_rel);
+    bool sw_in = within_bounds_2d(iy_sw, ix_sw, H_rel, W_rel);
+    bool se_in = within_bounds_2d(iy_se, ix_se, H_rel, W_rel);
+
+    // Skip if all corners out-of-bounds
+    if (!(nw_in || ne_in || sw_in || se_in)) {
+        output[idx] = 0.0f;
+        return;
+    }
+
     // get surfaces to each neighbor:
     float nw = (ix_se - ix)    * (iy_se - iy);
     float ne = (ix    - ix_sw) * (iy_sw - iy);
@@ -99,13 +111,13 @@ __global__ void relative_attention_forward_kernel(
     for (int c = 0; c < C; c++) {
         float bias_val = 0.0f;
         
-        if (within_bounds_2d(iy_nw, ix_nw, H_rel, W_rel))
+        if (nw_in)
             bias_val += rel_bias[iy_nw * (W_rel*C) + ix_nw * C + c] * nw;
-        if (within_bounds_2d(iy_ne, ix_ne, H_rel, W_rel))
+        if (ne_in)
             bias_val += rel_bias[iy_ne * (W_rel*C) + ix_ne * C + c] * ne;
-        if (within_bounds_2d(iy_sw, ix_sw, H_rel, W_rel))
+        if (sw_in)
             bias_val += rel_bias[iy_sw * (W_rel*C) + ix_sw * C + c] * sw;
-        if (within_bounds_2d(iy_se, ix_se, H_rel, W_rel))
+        if (se_in)
             bias_val += rel_bias[iy_se * (W_rel*C) + ix_se * C + c] * se;
 
         val += cur_query[c] * bias_val;
@@ -170,6 +182,17 @@ __global__ void relative_attention_backward_kernel(
     int ix_se = ix_nw + 1;
     int iy_se = iy_nw + 1;
     
+    // Check bounds for all four corners
+    bool nw_in = within_bounds_2d(iy_nw, ix_nw, H_rel, W_rel);
+    bool ne_in = within_bounds_2d(iy_ne, ix_ne, H_rel, W_rel);
+    bool sw_in = within_bounds_2d(iy_sw, ix_sw, H_rel, W_rel);
+    bool se_in = within_bounds_2d(iy_se, ix_se, H_rel, W_rel);
+
+    // Skip if all corners out-of-bounds
+    if (!(nw_in || ne_in || sw_in || se_in)) {
+        return;
+    }
+
     // get surfaces to each neighbor:
     float nw = (ix_se - ix)    * (iy_se - iy);
     float ne = (ix    - ix_sw) * (iy_sw - iy);
@@ -180,19 +203,19 @@ __global__ void relative_attention_backward_kernel(
     for (int c = 0; c < C; c++) {
         float bias_val = 0.0f;
         
-        if (within_bounds_2d(iy_nw, ix_nw, H_rel, W_rel)) {
+        if (nw_in) {
             bias_val += rel_bias[iy_nw * (W_rel*C) + ix_nw * C + c] * nw;
             atomicAdd(&grad_rel_bias[iy_nw * (W_rel*C) + ix_nw * C + c], dL * nw * cur_query[c]);
         }
-        if (within_bounds_2d(iy_ne, ix_ne, H_rel, W_rel)) {
+        if (ne_in) {
             bias_val += rel_bias[iy_ne * (W_rel*C) + ix_ne * C + c] * ne;
             atomicAdd(&grad_rel_bias[iy_ne * (W_rel*C) + ix_ne * C + c], dL * ne * cur_query[c]);
         }
-        if (within_bounds_2d(iy_sw, ix_sw, H_rel, W_rel)) {
+        if (sw_in) {
             bias_val += rel_bias[iy_sw * (W_rel*C) + ix_sw * C + c] * sw;
             atomicAdd(&grad_rel_bias[iy_sw * (W_rel*C) + ix_sw * C + c], dL * sw * cur_query[c]);
         }
-        if (within_bounds_2d(iy_se, ix_se, H_rel, W_rel)) {
+        if (se_in) {
             bias_val += rel_bias[iy_se * (W_rel*C) + ix_se * C + c] * se;
             atomicAdd(&grad_rel_bias[iy_se * (W_rel*C) + ix_se * C + c], dL * se * cur_query[c]);
         }
