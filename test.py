@@ -4,7 +4,8 @@ import time
 import gc
 import psutil
 import os
-from functions import RelativeGridAttnCUDAFunction, relative_grid_attn_python
+from functions import RelativeGridAttnCUDAFunction, relative_grid_attn_python, RelativeGridAttention
+
 
 def get_memory_info():
     """Get current memory usage information"""
@@ -34,8 +35,9 @@ def print_memory_usage(label, mem_info):
 
 def run_test():
     # Parameters
-    B, Q, C = 32, 300, 256
-    H, W = 16, 16
+    B, Q, C = 4, 300, 256
+    C_inner = 8
+    H, W = 128, 128
     H_rel, W_rel = 32, 32
     dtype = torch.float32
     
@@ -63,6 +65,14 @@ def run_test():
     pos_wh = torch.rand(B, Q, 2, device=device, dtype=dtype) * 0.5 + 0.1 # Ensure width/height > 0
     pos = torch.cat([pos_xy, pos_wh], dim=-1)
     rel_bias = torch.randn(H_rel, W_rel, C, device=device, dtype=dtype)
+    conv1_weight = torch.randn(C_inner,1,3,3, device=device, dtype=dtype)
+    #conv1_weight[:,:,:,:] = 1.0/9.0
+    conv1_bias = torch.randn(C_inner, device=device, dtype=dtype)
+    #conv1_bias[:,] = 0.0
+    conv2_weight = torch.randn(1,C_inner,3,3, device=device, dtype=dtype)
+    #conv2_weight[:,:,:,:] = 1.0/9.0
+    conv2_bias = torch.randn(1, device=device, dtype=dtype)
+    #conv2_bias[:] = 0.0
     
     after_tensor_creation = get_memory_info()
     print_memory_usage("After Tensor Creation", after_tensor_creation)
@@ -73,6 +83,10 @@ def run_test():
     keys_py = keys.clone().requires_grad_(True)
     pos_py = pos.clone().requires_grad_(False)
     rel_bias_py = rel_bias.clone().requires_grad_(True)
+    conv1_weight_py = conv1_weight.clone().requires_grad_(True)
+    conv1_bias_py = conv1_bias.clone().requires_grad_(True)
+    conv2_weight_py = conv2_weight.clone().requires_grad_(True)
+    conv2_bias_py = conv2_bias.clone().requires_grad_(True)
     
     # --- Forward and Backward for PyTorch implementation ---
     print("--- PyTorch Implementation ---")
@@ -86,7 +100,8 @@ def run_test():
     ) as prof:
         with record_function("pytorch_forward"):
             output_py = relative_grid_attn_python(
-                queries_py, keys_py, pos_py, rel_bias_py
+                queries_py, keys_py, pos_py, rel_bias_py,
+                conv1_weight_py, conv1_bias_py, conv2_weight_py, conv2_bias_py
             )
             if device.type == 'cuda': 
                 torch.cuda.synchronize()
@@ -94,6 +109,7 @@ def run_test():
     print("PYTORCH FORWARD PROFILER RESULTS:")
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
     
+    loss_py = output_py.sum()
     grad_output_val = torch.randn_like(output_py)
         
     with profile(
@@ -103,7 +119,8 @@ def run_test():
         with_stack=True
     ) as prof_bwd:
         with record_function("pytorch_backward"):
-            output_py.backward(grad_output_val.clone())
+            #output_py.backward(grad_output_val.clone())
+            loss_py.backward()
             if device.type == 'cuda': 
                 torch.cuda.synchronize()
     
@@ -121,6 +138,12 @@ def run_test():
         keys_cuda = keys.clone().requires_grad_(True)
         pos_cuda = pos.clone().requires_grad_(False)
         rel_bias_cuda = rel_bias.clone().requires_grad_(True)
+        conv1_weight_cuda = conv1_weight.clone().requires_grad_(True)
+        conv1_bias_cuda = conv1_bias.clone().requires_grad_(True)
+        conv2_weight_cuda = conv2_weight.clone().requires_grad_(True)
+        conv2_bias_cuda = conv2_bias.clone().requires_grad_(True)
+
+        cuda_module = RelativeGridAttention()
                 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -129,14 +152,17 @@ def run_test():
             with_stack=True
         ) as prof_cuda:
             with record_function("cuda_forward"):
-                output_cuda = RelativeGridAttnCUDAFunction.apply(
+                output_cuda = cuda_module(
                     queries_cuda, keys_cuda, pos_cuda, rel_bias_cuda,
+                    conv1_weight_cuda, conv1_bias_cuda, conv2_weight_cuda, conv2_bias_cuda
                 )
                 torch.cuda.synchronize()
         
         print("CUDA FORWARD PROFILER RESULTS:")
         print(prof_cuda.key_averages().table(sort_by="cuda_time_total", row_limit=10))
         
+        loss_cuda = output_cuda.sum()
+
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
@@ -144,7 +170,8 @@ def run_test():
             with_stack=True
         ) as prof_cuda_bwd:
             with record_function("cuda_backward"):
-                output_cuda.backward(grad_output_val.clone())
+                #output_cuda.backward(grad_output_val.clone())
+                loss_cuda.backward()
                 torch.cuda.synchronize()
         
         print("CUDA BACKWARD PROFILER RESULTS:")
