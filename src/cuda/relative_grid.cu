@@ -1,3 +1,4 @@
+#include <ATen/native/cuda/KernelUtils.cuh>
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -118,12 +119,11 @@ __global__ void fused_attn_forward_kernel(
     output[idx] += rel_val;
 }
 
-__global__ void fused_attn_backward_kernel(
+__global__ void attn_grad_rel_bias_backward_kernel(
     const float* __restrict__ grad_out,   // [B, Q, H, W]
     const float* __restrict__ queries,    // [B, Q, C]
     const float* __restrict__ pos,        // [B, Q, 4]
     const float* __restrict__ rel_bias,   // [H_rel, W_rel, C]
-    float* __restrict__ grad_queries,     // [B, Q, C]
     float* __restrict__ grad_rel_bias,    // [H_rel, W_rel, C]
     const int B,
     const int Q,
@@ -131,7 +131,8 @@ __global__ void fused_attn_backward_kernel(
     const int H,
     const int W,
     const int H_rel,
-    const int W_rel
+    const int W_rel,
+    const int grad_rel_bias_memory_span
 ) {
     const int total_elements = B * Q * H * W;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -192,32 +193,92 @@ __global__ void fused_attn_backward_kernel(
         const float dL_q_val = dL * q_val;
 
         // Relative gradients rel_bias
-        float bias_val = 0.0f;
         if (nw_in) {
-            bias_val += rel_bias[iy_nw * (W_rel * C) + ix_nw * C + c] * nw;
-            atomicAdd(&grad_rel_bias[iy_nw * (W_rel * C) + ix_nw * C + c], nw * dL_q_val);
-            //grad_rel_bias[iy_nw * (W_rel * C) + ix_nw * C + c] += nw * dL_q_val;
+            at::native::fastAtomicAdd(grad_rel_bias, iy_nw * (W_rel * C) + ix_nw * C + c, grad_rel_bias_memory_span, nw * dL_q_val, true);
         }
         if (ne_in) {
-            bias_val += rel_bias[iy_ne * (W_rel * C) + ix_ne * C + c] * ne;
-            atomicAdd(&grad_rel_bias[iy_ne * (W_rel * C) + ix_ne * C + c], ne * dL_q_val);
-            //grad_rel_bias[iy_ne * (W_rel * C) + ix_ne * C + c] += ne * dL_q_val;
+            at::native::fastAtomicAdd(grad_rel_bias, iy_ne * (W_rel * C) + ix_ne * C + c, grad_rel_bias_memory_span, ne * dL_q_val, true);
         }
         if (sw_in) {
-            bias_val += rel_bias[iy_sw * (W_rel * C) + ix_sw * C + c] * sw;
-            atomicAdd(&grad_rel_bias[iy_sw * (W_rel * C) + ix_sw * C + c], sw * dL_q_val);
-            //grad_rel_bias[iy_sw * (W_rel * C) + ix_sw * C + c] += sw * dL_q_val;
+            at::native::fastAtomicAdd(grad_rel_bias, iy_sw * (W_rel * C) + ix_sw * C + c, grad_rel_bias_memory_span, sw * dL_q_val, true);
         }
         if (se_in) {
-            bias_val += rel_bias[iy_se * (W_rel * C) + ix_se * C + c] * se;
-            atomicAdd(&grad_rel_bias[iy_se * (W_rel * C) + ix_se * C + c], se * dL_q_val);
-            //grad_rel_bias[iy_se * (W_rel * C) + ix_se * C + c] += se * dL_q_val;
-        }
-        
-        // Content and relative gradients for queries
-        atomicAdd(&grad_queries[query_idx + c], dL * bias_val);
-        //grad_queries[query_idx + c] += dL * bias_val;
+            at::native::fastAtomicAdd(grad_rel_bias, iy_se * (W_rel * C) + ix_se * C + c, grad_rel_bias_memory_span, se * dL_q_val, true);
+        }        
     }
+}
+
+__global__ void attn_grad_queries_backward_kernel(
+    const float* __restrict__ grad_out,
+    const float* __restrict__ rel_bias,
+    const float* __restrict__ pos,
+    float* __restrict__ grad_queries,
+    const int B,
+    const int Q,
+    const int C,
+    const int H,
+    const int W,
+    const int H_rel,
+    const int W_rel
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * Q * C) return;
+
+    int c = idx % C;
+    int q = (idx / C) % Q;
+    int b = idx / (C * Q);
+
+    const float* p = pos + (b * Q + q) * 4;
+    float x_center = p[0];
+    float y_center = p[1];
+    float width = p[2];
+    float height = p[3];
+
+    float sum = 0.0f;
+    for (int h = 0; h < H; h++) {
+        for (int w = 0; w < W; w++) {
+            float gx = (W > 1) ? static_cast<float>(w) / (W - 1) : 0.0f;
+            float gy = (H > 1) ? static_cast<float>(h) / (H - 1) : 0.0f;
+
+            float rel_x = (x_center - gx) / width;
+            float rel_y = (y_center - gy) / height;
+
+            float ix = grid_sampler_unnormalize(rel_x, W_rel);
+            float iy = grid_sampler_unnormalize(rel_y, H_rel);
+
+            int ix_nw = static_cast<int>(floorf(ix));
+            int iy_nw = static_cast<int>(floorf(iy));
+            int ix_ne = ix_nw + 1;
+            int iy_ne = iy_nw;
+            int ix_sw = ix_nw;
+            int iy_sw = iy_nw + 1;
+            int ix_se = ix_nw + 1;
+            int iy_se = iy_nw + 1;
+
+            float nw = (ix_se - ix) * (iy_se - iy);
+            float ne = (ix - ix_sw) * (iy_sw - iy);
+            float sw = (ix_ne - ix) * (iy - iy_ne);
+            float se = (ix - ix_nw) * (iy - iy_nw);
+
+            float bias_val = 0.0f;
+            if (within_bounds_2d(iy_nw, ix_nw, H_rel, W_rel)) {
+                bias_val += rel_bias[iy_nw * W_rel * C + ix_nw * C + c] * nw;
+            }
+            if (within_bounds_2d(iy_ne, ix_ne, H_rel, W_rel)) {
+                bias_val += rel_bias[iy_ne * W_rel * C + ix_ne * C + c] * ne;
+            }
+            if (within_bounds_2d(iy_sw, ix_sw, H_rel, W_rel)) {
+                bias_val += rel_bias[iy_sw * W_rel * C + ix_sw * C + c] * sw;
+            }
+            if (within_bounds_2d(iy_se, ix_se, H_rel, W_rel)) {
+                bias_val += rel_bias[iy_se * W_rel * C + ix_se * C + c] * se;
+            }
+
+            float dL = grad_out[((b * Q + q) * H + h) * W + w];
+            sum += dL * bias_val;
+        }
+    }
+    grad_queries[(b * Q + q) * C + c] += sum;
 }
 
 torch::Tensor fused_attn_forward(
@@ -281,18 +342,32 @@ std::vector<torch::Tensor> fused_attn_backward(
     auto grad_keys = torch::matmul(grad_out.view({B, Q, H * W}).transpose(1, 2), queries).view({B, H, W, C}) * (1.0f / std::sqrt(C));
     auto grad_rel_bias = torch::zeros_like(rel_bias);
     
-    const int total_elements = B * Q * H * W;
-    const int blocks = (total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    
-    fused_attn_backward_kernel<<<blocks, THREADS_PER_BLOCK>>>(
-        grad_out.data_ptr<float>(),
-        queries.data_ptr<float>(),
-        pos.data_ptr<float>(),
-        rel_bias.data_ptr<float>(),
-        grad_queries.data_ptr<float>(),
-        grad_rel_bias.data_ptr<float>(),
-        B, Q, C, H, W, H_rel, W_rel
-    );
+    {
+        const int total_elements = B * Q * H * W;
+        const int blocks = (total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        
+        attn_grad_rel_bias_backward_kernel<<<blocks, THREADS_PER_BLOCK>>>(
+            grad_out.data_ptr<float>(),
+            queries.data_ptr<float>(),
+            pos.data_ptr<float>(),
+            rel_bias.data_ptr<float>(),
+            grad_rel_bias.data_ptr<float>(),
+            B, Q, C, H, W, H_rel, W_rel,
+            static_cast<int>(grad_rel_bias.numel())
+        );
+    }
+
+    {
+        const int total_elements = B * Q * C;
+        const int blocks = (total_elements + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        attn_grad_queries_backward_kernel<<<blocks, THREADS_PER_BLOCK>>>(
+            grad_out.data_ptr<float>(),
+            rel_bias.data_ptr<float>(),
+            pos.data_ptr<float>(),
+            grad_queries.data_ptr<float>(),
+            B, Q, C, H, W, H_rel, W_rel
+        );
+    }
     
     return {grad_queries, grad_keys, grad_rel_bias};
 }
